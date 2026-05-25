@@ -5,18 +5,14 @@ set -euo pipefail
 # REQUIRED CONFIGURATION
 # Set this to the specific Claude Code project directory containing
 # the session .jsonl files you want to export.
-#
-# Example:
-# PROJECT_DIR="$HOME/.claude/projects/-Users-jake-src-my-project"
 # -------------------------------------------------------------------
-PROJECT_DIR="$HOME/.claude/projects/REPLACE_WITH_SPECIFIC_PROJECT_DIR"
+PROJECT_DIR="$HOME/.claude/projects/YOUR_PROJECT_DIR"
 
 # Local export storage path.
 EXPORT_DIR="$HOME/claude_exports"
 
 mkdir -p "$EXPORT_DIR"
 
-# Resolve PROJECT_DIR physically and fail if it does not exist.
 if [ ! -d "$PROJECT_DIR" ]; then
     printf 'Error: PROJECT_DIR does not exist or is not a directory:\n%s\n' "$PROJECT_DIR" >&2
     exit 1
@@ -62,84 +58,172 @@ validate_session_file() {
     [ -f "$PROJECT_DIR_REAL/$candidate_base" ]
 }
 
-# Return a validated absolute path to a direct child file in PROJECT_DIR.
+# List direct .jsonl children only.
+list_session_files() {
+    find "$PROJECT_DIR_REAL" \
+        -maxdepth 1 \
+        -type f \
+        -name "*.jsonl" \
+        -print \
+    | sort
+}
+
+# Print direct .jsonl children whose basename contains a query literally.
+# Uses grep -F for fixed-string matching rather than shell glob semantics.
+find_sessions_by_filename_literal() {
+    local query="$1"
+
+    list_session_files \
+    | while IFS= read -r file; do
+        basename "$file" | grep -Fqi -- "$query" && printf '%s\n' "$file"
+      done \
+    | sort -u
+}
+
+# Print direct .jsonl children whose content appears to match the requested
+# session title/name/query.
+#
+# This has two passes:
+#   1. Structured jq search against likely title/name/summary fields.
+#   2. Raw fixed-string grep fallback across the JSONL file.
+#
+# Both passes are confined to direct .jsonl children of PROJECT_DIR.
+find_sessions_by_content_literal() {
+    local query="$1"
+    local file
+
+    list_session_files \
+    | while IFS= read -r file; do
+        validate_session_file "$file" || continue
+
+        # Structured title/name/summary search.
+        #
+        # This intentionally checks a broad set of likely fields because Claude
+        # Code transcript event schemas can vary.
+        if jq -e --arg q "$query" '
+            def norm:
+                tostring
+                | ascii_downcase;
+
+            def has_query:
+                norm
+                | contains($q | ascii_downcase);
+
+            any(
+                [
+                    .title?,
+                    .name?,
+                    .summary?,
+                    .sessionName?,
+                    .session_name?,
+                    .conversationTitle?,
+                    .conversation_title?,
+                    .message.title?,
+                    .message.name?,
+                    .message.summary?,
+                    .message.sessionName?,
+                    .message.session_name?,
+                    .message.conversationTitle?,
+                    .message.conversation_title?
+                ][];
+                . != null and has_query
+            )
+        ' "$file" >/dev/null 2>&1; then
+            printf '%s\n' "$file"
+            continue
+        fi
+
+        # Raw fixed-string fallback. This catches names/titles embedded in
+        # schema variants not covered above.
+        if grep -Fqi -- "$query" "$file"; then
+            printf '%s\n' "$file"
+        fi
+      done \
+    | sort -u
+}
+
+# Resolve a user's session argument to exactly one validated session file.
 resolve_session_file() {
     local session_param="${1:-}"
     local candidate
-    local match_count
     local matched_file
+    local matches
+    local match_count
 
     if [ -n "$session_param" ]; then
-        # Full or relative path, but still constrained to direct child of PROJECT_DIR.
+        # 1. Full or relative path. Still constrained to direct child of PROJECT_DIR.
         if validate_session_file "$session_param"; then
             printf '%s/%s\n' "$PROJECT_DIR_REAL" "$(basename "$session_param")"
             return 0
         fi
 
-        # Exact filename inside PROJECT_DIR.
+        # 2. Exact filename inside PROJECT_DIR.
         candidate="$PROJECT_DIR_REAL/$session_param"
         if validate_session_file "$candidate"; then
             printf '%s\n' "$candidate"
             return 0
         fi
 
-        # Exact session id without .jsonl.
+        # 3. Exact session id without .jsonl.
         candidate="$PROJECT_DIR_REAL/${session_param}.jsonl"
         if validate_session_file "$candidate"; then
             printf '%s\n' "$candidate"
             return 0
         fi
 
-        # Partial match, direct children only, deterministic, fail if ambiguous.
-        # No recursion. No subdirectories.
+        # 4. Literal partial filename match.
+        matches=$(find_sessions_by_filename_literal "$session_param")
         match_count=$(
-            find "$PROJECT_DIR_REAL" \
-                -maxdepth 1 \
-                -type f \
-                -name "*${session_param}*.jsonl" \
-                -print \
-            | sort \
+            printf '%s\n' "$matches" \
+            | sed '/^$/d' \
             | wc -l \
             | tr -d ' '
         )
 
         if [ "$match_count" = "1" ]; then
-            matched_file=$(
-                find "$PROJECT_DIR_REAL" \
-                    -maxdepth 1 \
-                    -type f \
-                    -name "*${session_param}*.jsonl" \
-                    -print \
-                | sort \
-                | head -n 1
-            )
+            matched_file=$(printf '%s\n' "$matches" | sed '/^$/d' | head -n 1)
 
             if validate_session_file "$matched_file"; then
                 printf '%s\n' "$matched_file"
                 return 0
             fi
         elif [ "$match_count" -gt 1 ]; then
-            printf "Error: Session parameter is ambiguous: %s\n" "$session_param" >&2
+            printf "Error: Session parameter is ambiguous as a filename match: %s\n" "$session_param" >&2
             printf "Matching sessions:\n" >&2
-            find "$PROJECT_DIR_REAL" \
-                -maxdepth 1 \
-                -type f \
-                -name "*${session_param}*.jsonl" \
-                -print \
-            | sort \
-            | xargs -n 1 basename >&2
+            printf '%s\n' "$matches" \
+                | sed '/^$/d' \
+                | xargs -n 1 basename >&2
             return 1
         fi
 
-        printf "Error: Could not find a session log matching '%s' in:\n%s\n" "$session_param" "$PROJECT_DIR_REAL" >&2
-        printf "Available sessions:\n" >&2
-        find "$PROJECT_DIR_REAL" \
-            -maxdepth 1 \
-            -type f \
-            -name "*.jsonl" \
-            -print \
-        | sort \
-        | xargs -n 1 basename 2>/dev/null >&2 || true
+        # 5. Literal content/title/name match.
+        matches=$(find_sessions_by_content_literal "$session_param")
+        match_count=$(
+            printf '%s\n' "$matches" \
+            | sed '/^$/d' \
+            | wc -l \
+            | tr -d ' '
+        )
+
+        if [ "$match_count" = "1" ]; then
+            matched_file=$(printf '%s\n' "$matches" | sed '/^$/d' | head -n 1)
+
+            if validate_session_file "$matched_file"; then
+                printf '%s\n' "$matched_file"
+                return 0
+            fi
+        elif [ "$match_count" -gt 1 ]; then
+            printf "Error: Session parameter is ambiguous as a content/name/title match: %s\n" "$session_param" >&2
+            printf "Matching sessions:\n" >&2
+            printf '%s\n' "$matches" \
+                | sed '/^$/d' \
+                | xargs -n 1 basename >&2
+            return 1
+        fi
+
+        printf "❌ Error: Could not find a session matching '%s' in:\n%s\n" "$session_param" "$PROJECT_DIR_REAL" >&2
+        printf "Available direct .jsonl sessions:\n" >&2
+        list_session_files | xargs -n 1 basename 2>/dev/null >&2 || true
         return 1
     fi
 
@@ -179,23 +263,38 @@ SELECTED_SESSION=$(resolve_session_file "$SESSION_PARAM")
 SESSION_ID=$(basename "$SELECTED_SESSION" .jsonl)
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-# Keep the output filename sane even if the session id contains unusual characters.
-SAFE_SESSION_ID=$(printf '%s' "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')
-OUTPUT_FILE="$EXPORT_DIR/export_${TIMESTAMP}_${SAFE_SESSION_ID}.md"
+# Use the provided session name/query in the export filename when supplied.
+# Otherwise fall back to the actual session id.
+if [ -n "${SESSION_PARAM:-}" ]; then
+    OUTPUT_BASENAME="$SESSION_PARAM"
+else
+    OUTPUT_BASENAME="$SESSION_ID"
+fi
 
-printf 'Processing session history log: %s\n' "$SESSION_ID"
-printf 'Project directory: %s\n' "$PROJECT_DIR_REAL"
-printf 'Target path: %s\n' "$SELECTED_SESSION"
+# Keep the output filename sane even if the session name contains spaces,
+# punctuation, slashes, or other unusual characters.
+SAFE_OUTPUT_BASENAME=$(
+    printf '%s' "$OUTPUT_BASENAME" \
+    | tr '/[:space:]' '__' \
+    | tr -c 'A-Za-z0-9._-' '_'
+)
 
-{
-    printf '%s\n' '---'
-    printf 'title: %s\n' 'Claude Code Custom Transcript'
-    printf 'date: %s\n' "$(date)"
-    printf 'session_id: %s\n' "$SESSION_ID"
-    printf 'source_file: %s\n' "$SELECTED_SESSION"
-    printf '%s\n' '---'
-    printf '\n'
-} > "$OUTPUT_FILE"
+# Collapse repeated underscores and trim leading/trailing underscores.
+SAFE_OUTPUT_BASENAME=$(
+    printf '%s' "$SAFE_OUTPUT_BASENAME" \
+    | sed -E 's/_+/_/g; s/^_+//; s/_+$//'
+)
+
+# Defensive fallback in case the provided name sanitizes to an empty string.
+if [ -z "$SAFE_OUTPUT_BASENAME" ]; then
+    SAFE_OUTPUT_BASENAME="$SESSION_ID"
+fi
+
+OUTPUT_FILE="$EXPORT_DIR/export_${TIMESTAMP}_${SAFE_OUTPUT_BASENAME}.md"
+
+printf '%s\n' "Processing session history log: $SESSION_ID"
+printf '%s\n' "Project directory: $PROJECT_DIR_REAL"
+printf '%s\n' "Target path: $SELECTED_SESSION"
 
 # Stream and parse the JSONL.
 #
@@ -237,7 +336,7 @@ while IFS= read -r line; do
 
         if [ -n "$USER_TEXT" ]; then
             {
-                printf '### 👤 User\n\n'
+                printf '### User\n\n'
                 printf '%s\n\n' "$USER_TEXT"
             } >> "$OUTPUT_FILE"
         fi
@@ -275,13 +374,13 @@ while IFS= read -r line; do
             printf '### Claude\n\n'
 
             if [ -n "$REASONING" ]; then
-                printf '#### Internal Reasoning Trace\n\n'
+                printf '#### Reasoning\n\n'
                 write_indented_block "$REASONING"
                 printf '\n\n'
             else
                 # Do not silently omit reasoning. If an assistant message lacks
                 # a reasoning block, make that absence explicit in the export.
-                printf '#### Internal Reasoning Trace\n\n'
+                printf '#### Reasoning\n\n'
                 printf '    [No reasoning block found in this assistant message.]\n\n'
             fi
 
