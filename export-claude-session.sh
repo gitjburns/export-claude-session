@@ -370,6 +370,12 @@ while IFS= read -r line; do
             ' <<< "$line"
         )
 
+        # Skip assistant records that have no exportable content.
+        # This suppresses empty Claude sections for tool-call-only events.
+        if [ -z "$REASONING" ] && [ -z "$TEXT_RESPONSE" ]; then
+            continue
+        fi
+
         {
             printf '### Claude\n\n'
 
@@ -377,11 +383,6 @@ while IFS= read -r line; do
                 printf '#### Reasoning\n\n'
                 write_indented_block "$REASONING"
                 printf '\n\n'
-            else
-                # Do not silently omit reasoning. If an assistant message lacks
-                # a reasoning block, make that absence explicit in the export.
-                printf '#### Reasoning\n\n'
-                printf '    [No reasoning block found in this assistant message.]\n\n'
             fi
 
             if [ -n "$TEXT_RESPONSE" ]; then
